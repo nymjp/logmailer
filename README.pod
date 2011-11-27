@@ -1,0 +1,193 @@
+=encoding utf-8
+
+=head1 NAME
+
+logmailer - コマンドの出力をメール送信する
+
+=head1 USAGE
+
+ $ logmailer OPTIONS COMMAND [ARGS...]
+
+=head1 DESCRIPTION
+
+logmailer は、出力ハンドラプロセスを複数立ち上げ、指定されたファイルディ
+スクリプタを接続した後、I<COMMAND> を exec する。
+
+デフォルトでは、標準出力、標準エラー出力をハンドルするが、3番以降の任意
+のファイルディスクリプタもハンドル可能である。
+
+なお、出力が何も無い場合は、メールは送信されない。このため、動作ログは
+標準出力、エラーはエラー出力に対して出力するコマンドであれば、エラー発
+生時にのみ特別の Subject を持ったエラーメールを送信することができる。
+
+=head1 OPTIONS
+
+=over 4
+
+=item --help
+
+このヘルプを表示する。
+
+=item --version
+
+バージョンを表示する。
+
+=item --dump
+
+設定を表示する。
+
+=back
+
+以下のオプションは、定義された順に処理される。
+
+なお、I<VALUE> が "ファイルディスクリプタ:" で始まる場合は数字で示され
+たファイルディスクリプタの設定、そうでない場合は、デフォルト設定として
+扱われる。ファイルディスクリプタは、カンマ区切りで複数指定可能である。
+
+また、I<FD> も、カンマ区切りにより複数指定可能である。
+
+デフォルト設定は、すべてのオプションを読み込んだ後に、定義済みの各ファ
+イルディスクリプタ設定にマージされる。各ファイルディスクリプタの設定と
+デフォルト設定が競合した場合は、各ファイルディスクリプタの設定が優先さ
+れる。
+
+=over 4
+
+=item --config=I<YAML_FILENAME>
+
+これまでの設定を削除し、I<YAML_FILENAME> の内容で上書きする。
+
+構文は、コマンドライン引数で任意の設定を行い、--dump オプションを付加し
+て呼び出した場合の出力を参照のこと。
+
+=back
+
+以下のオプションは、定義された順に処理される。
+
+=over 4
+
+=item --type=I<VALUE>
+
+メールの送信方法を指定する。I<VALUE> は以下の何れかの値をとる。
+
+=over 2
+
+=item * Mail::Mailer コンストラクタの第1引数
+
+=item * "redirect"
+
+メールを送信せず、--redirect オプションで設定されたファイルディスクリプ
+タにリダイレクトする。
+
+=item * "nomail"
+
+メールを送信しない。
+
+=back
+
+=item --redirect=I<VALUE>
+
+ファイルディスクリプタ I<VALUE> にリダイレクトする。
+
+メールは送信されず、オプション --tee, --file の指定は無視される。
+
+また、自身のファイルディスクリプタへのリダイレクト設定は無視される。
+
+=item --tee=I<FD>
+
+ファイルディスクリプタ I<FD> にもコピーする。
+
+また、自身のファイルディスクリプタへのコピー設定は無視される。
+
+=item --file=I<VALUE>
+
+ファイル名 I<VALUE> にも追記保存する。
+
+=item --timestamp[=I<VALUE>], --ts[=I<VALUE>]
+
+入力された各行に、strftime でフォーマットされた I<VALUE> を付加する。
+
+I<VALUE> が省略された場合は、'%F %T - ' が指定されたものとする。
+
+=item --notimestamp=I<FD>, --nots=I<FD>
+
+ファイルディスクリプタ I<FD> の --timestamp 設定を無効にする。
+
+=item --header=I<KEY>=I<VALUE>
+
+メールヘッダ I<KEY> を I<VALUE> に設定する。
+
+=item --mailer=I<KEY>=I<VALUE>
+
+L<Mail::Mailer> コンストラクタの第2引数以降に渡す値を設定する。
+
+=item --subject=I<VALUE>
+
+--header=subject=I<VALUE> のエイリアス。
+
+=item --subject-prefix=I<VALUE>
+
+--header=subject-prefix=I<VALUE> のエイリアス。
+
+=item --subject-suffix=I<VALUE>
+
+--header=subject-suffix=I<VALUE> のエイリアス。
+
+=item --to=I<VALUE>
+
+--header=to=I<VALUE> のエイリアス。
+
+=back
+
+=head1 EXAMPLES
+
+以下の例は、標準出力と標準エラー出力を各行にタイムスタンプを付加してメー
+ルサーバ localhost からメール送信する。標準エラー出力メールの Subject
+は、先頭に"**ALERT**" を付加する。また、標準出力と標準エラー出力をファ
+イル "backup.log" に出力する。
+
+ $ logmailer --type=smtp --mailer=Server=localhost --ts \
+   --subject=BackupResult --subject-prefix='2:**ALERT**' \
+   --tee=3 --type=3:nomail --file=3:backup.log --nots=3 \
+   SOME_BACKUP_COMMAND
+
+=head1 TIPS
+
+設定方法が複雑なため、以下の順で確認するとよいかもしれない。
+このとき、I<COMMAND> は、"echo foo; echo bar >&2" などとするとよい。
+
+=over 4
+
+=item 1. --dump オプションを指定し、エラーが無いことを確認する。
+
+=item 2. --type=testfile オプションを指定し、出力された mailer.testfile の内容が正しいことを確認する
+
+=back
+
+=head1 KNOWN ISSUES
+
+=over 4
+
+=item 設定の事前チェックが完全ではない。
+
+本運用する前に、期待する動作が行われることを確認する必要がある。
+
+=back
+
+=head1 AUTHOR
+
+YAMAMOTO, N. <nym at nym.jp>
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright (C) 2011 YAMAMOTO, N. <nym at nym.jp>
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of either: the GNU General Public License as published
+by the Free Software Foundation; or the Artistic License.
+
+See http://dev.perl.org/licenses/ for more information.
+
+
+=cut
+

@@ -1,0 +1,721 @@
+#!/usr/bin/perl
+#
+# logmailer
+#
+# LICENSE AND COPYRIGHT
+#
+# Copyright (C) 2011 YAMAMOTO, N. <nym at nym.jp>
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of either: the GNU General Public License as published
+# by the Free Software Foundation; or the Artistic License.
+#
+# See http://dev.perl.org/licenses/ for more information.
+#
+
+use 5.008;
+use utf8;
+use strict;
+use warnings;
+
+our $VERSION = 0.01;
+
+package LogMailer::FHStore;
+use FileHandle;
+
+sub new {
+    my $class = shift;
+    bless {}, $class;
+}
+
+sub create_pipe {
+    my $self = shift;
+    my ($fd) = @_;
+    return $self->{$fd} if defined $self->{$fd};
+
+    pipe my ( $rfh, $wfh );
+    $wfh->autoflush(1);
+    $self->{$fd} = { rfh => $rfh, wfh => $wfh };
+}
+
+sub get_wfh {
+    my $self = shift;
+    my ($fd) = @_;
+    $self->create_pipe($fd)->{wfh};
+}
+
+sub get_rfh {
+    my $self = shift;
+    my ($fd) = @_;
+    $self->create_pipe($fd)->{rfh};
+}
+
+sub add_tfh {
+    my $self = shift;
+    my ( $fd, $fh ) = @_;
+    $self->{$fd}{tee} ||= [];
+    push @{ $self->{$fd}{tee} }, $fh;
+    1;
+}
+
+sub get_tfh {
+    my $self = shift;
+    my ($fd) = @_;
+    $self->{$fd}{tee} || [];
+}
+
+sub clear {
+    my $self = shift;
+    %$self = ();
+}
+
+package LogMailer::Mailer;
+use Mail::Mailer;
+use Mail::Header;
+use Encode qw(encode);
+use POSIX qw(strftime);
+
+sub new {
+    my $class = shift;
+    my ( $conf, $tee ) = @_;
+    my $self = bless {
+        header => (
+            defined $conf->{header} ? $class->encode_header( $conf->{header} )
+            : undef
+        ),
+        mailer => (
+            $conf->{mailer}
+            ? Mail::Mailer->new( $conf->{type}, %{ $conf->{mailer} } )
+            : undef
+        ),
+        timestamp => $conf->{timestamp},
+        fh        => $tee,
+        is_init   => undef,
+    }, $class;
+    unshift @{ $self->{fh} }, $self->{mailer} if $self->{mailer};
+    $self;
+}
+
+sub spawn {
+    my $class = shift;
+    my ( $fd, $conf, $pipes ) = @_;
+
+    pipe my ( $to_parent_fh, $from_child_fh );
+
+    my $pid;
+    if ( $pid = fork ) {
+        close $from_child_fh;
+        return $to_parent_fh;
+    }
+    elsif ( defined $pid ) {
+        close $to_parent_fh;
+
+        my $fh  = $pipes->get_rfh($fd);
+        my $tee = $pipes->get_tfh($fd);
+        $pipes->clear;
+
+        my $obj = $class->new( $conf, $tee );
+        print $from_child_fh "READY";    # notify ready
+        close $from_child_fh;
+
+        while (<$fh>) {
+
+            #warn "read(", fileno($fh), "): $_";
+            $obj->write_line($_);
+        }
+        if ( $obj->{mailer} && $obj->{is_init} ) {
+            $obj->{mailer}->close
+                or die "couldn't send whole message: $!\n";
+        }
+
+        #warn "done.";
+        exit 0;
+    }
+    else {
+        die "fork failed.\n";
+    }
+}
+
+sub encode_header {
+    my $class = shift;
+    my ($header) = @_;
+
+    my $newheader = Mail::Header->new();
+    while ( my ( $k, $v ) = each %$header ) {
+        if ( lc($k) eq 'date' ) {
+            my $date = Mail::Field::Date->new( Date => undef );
+            if ( $v =~ /^\d+$/ ) {
+                $date->set( Time => $v );
+                $v = $date->text;
+            }
+        }
+        $newheader->add( $k, encode( 'MIME-Header', $v ) );
+    }
+    $newheader->header_hashref;
+}
+
+sub write_line {
+    my $self = shift;
+    if ( !$self->{is_init} ) {
+        my $mailer = $self->{mailer};
+        $self->{mailer}->open( $self->{header} ) if $self->{mailer};
+        $self->{is_init} = 1;
+    }
+
+    if ( defined $self->{timestamp} ) {
+        unshift @_, strftime( $self->{timestamp}, localtime );
+    }
+
+    for ( @{ $self->{fh} } ) {
+        print $_ @_ or die "write error!!";
+    }
+}
+
+package main;
+
+use Encode;
+use FileHandle;
+use YAML::Syck;
+use Getopt::Long qw(:config auto_version);
+use Pod::Usage;
+use POSIX qw(dup2);
+use Mail::Field::Date;
+
+$YAML::Syck::ImplicitUnicode = 1;
+
+my %config = (
+    1 => undef,
+    2 => undef,
+);
+
+sub usage {
+    pod2usage(
+        -exitstatus => 0,
+        -verbose    => 2,
+        -noperldoc  => 1,
+    );
+}
+
+sub process_fd_opt {
+    my ( $category, $opt, $default ) = @_;
+    my ( $key, $val ) = @$opt;
+    $val = decode_utf8($val);
+
+    if ( $val =~ /^([\d,]+):(.*)/ ) {
+        $val = $2;
+        $val = $default if defined $default && $val eq '';
+        my @fd = split /,/, $1;
+        for my $fd (@fd) {
+            if ( defined $category ) {
+                $config{$fd}{$category}{$key} = $val;
+            }
+            else {
+                $config{$fd}{$key} = $val;
+            }
+        }
+        return @fd;
+    }
+    else {
+        $val = $default if defined $default && $val eq '';
+        if ( defined $category ) {
+            $config{$category}{$key} = $val;
+        }
+        else {
+            $config{$key} = $val;
+        }
+        return;
+    }
+}
+
+my ($DUMP);
+GetOptions(
+    'help|h|?' => \&usage,
+    'dump'     => \$DUMP,
+    'config=s' => sub {
+        shift;
+        %config = %{ LoadFile(shift) };
+        $config{$_} ||= {} for ( 1 .. 2 );
+    },
+    'header=s%' => sub { shift; process_fd_opt "header", \@_ },
+    'mailer=s%' => sub { shift; process_fd_opt "mailer", \@_ },
+    'subject=s'        => sub { process_fd_opt "header", \@_ },
+    'subject-prefix=s' => sub { process_fd_opt "header", \@_ },
+    'subject-suffix=s' => sub { process_fd_opt "header", \@_ },
+    'to=s'             => sub { process_fd_opt "header", \@_ },
+    'from=s'           => sub { process_fd_opt "header", \@_ },
+    'redirect=s'       => sub {
+        my @fd = process_fd_opt undef, @_;
+        $config{$_}{type} = 'redirect' for (@fd);
+    },
+    'file=s'         => sub { process_fd_opt undef, \@_ },
+    'type=s'         => sub { process_fd_opt undef, \@_ },
+    'tee=s'          => sub { process_fd_opt undef, \@_ },
+    'timestamp|ts:s' => sub { process_fd_opt undef, \@_, '%F %T - ' },
+
+    'notimestamp|nots=s' => sub {
+        shift;
+        map { undef $config{$_}{timestamp} } split /,\s*/, shift;
+    }
+) or die usage();
+
+my @fd = grep {/^\d+$/} sort keys %config;
+
+# config fill / check
+eval {
+
+    for my $fd (@fd) {
+        warn "checking fd:$fd ...\n" if ($DUMP);
+        my $cconf = $config{$fd};
+
+        if ( !$cconf->{type} ) {
+            $cconf->{type} = $config{type} || 'nomail';
+        }
+
+        # fill with defaults
+        for my $category (qw( type mailer header redirect tee timestamp )) {
+            if ( ref( $config{$category} ) eq 'HASH' ) {
+                for ( keys %{ $config{$category} } ) {
+                    $cconf->{$category}{$_} = $config{$category}{$_}
+                        unless defined $cconf->{$category}{$_};
+                }
+            }
+            elsif ( !exists $cconf->{$category} ) {
+                $cconf->{$category} = $config{$category};
+            }
+        }
+
+        # check type
+        $cconf->{type} ||= 'nomail';
+        my $type = $cconf->{type};
+        if ( $type eq 'nomail' ) {
+            delete $cconf->{mailer};
+            delete $cconf->{header};
+        }
+        elsif ( $type eq 'redirect' ) {
+            my %keys = ( type => 1, redirect => 1 );
+            for ( grep { !$keys{$_} } keys %{$cconf} ) {
+                delete $cconf->{$_};
+            }
+            $cconf->{redirect} = undef unless defined $cconf->{redirect};
+        }
+        else {
+            delete $cconf->{redirect};
+            for (qw( mailer header tee )) {
+                $cconf->{$_} = undef unless defined $cconf->{$_};
+            }
+        }
+
+        # check structure
+        if ( exists $cconf->{mailer} ) {
+            ;    # no check
+        }
+        if ( exists $cconf->{header} ) {
+            die "unknown header structure.\n"
+                unless ref $cconf->{header} eq 'HASH';
+            for ( values %{ $cconf->{header} } ) {
+                die "unknown header value structure.\n"
+                    if ref;
+            }
+        }
+        if ( exists $cconf->{timestamp} ) {
+            die "unknown timestamp structure.\n"
+                if ref $cconf->{timestamp};
+        }
+        if ( exists $cconf->{redirect} ) {
+            die "unknown redirect structure.\n"
+                if ref $cconf->{redirect};
+        }
+        if ( exists $cconf->{tee} ) {
+            my $type = ref $cconf->{tee};
+            if ( $type eq 'ARRAY' ) {
+                for ( @{ $cconf->{tee} } ) {
+                    die "unknown tee structure.\n"
+                        if ref;
+                }
+            }
+            elsif ($type) {
+                die "unknown tee structure.\n";
+            }
+        }
+
+        # process subject-(prefix|surffix)
+        {
+            my $header = $cconf->{header};
+            $header->{subject}
+                = delete( $header->{'subject-prefix'} ) . $header->{subject}
+                if defined $header->{'subject-prefix'};
+            $header->{subject} .= delete $header->{'subject-suffix'}
+                if defined $header->{'subject-suffix'};
+        }
+
+        # expand tee
+        if ( exists $cconf->{tee} ) {
+            my $ttype = ref $cconf->{tee};
+            if ( !defined $cconf->{tee} ) {
+                $cconf->{tee} = [];
+            }
+            elsif ( !$ttype ) {
+                $cconf->{tee}
+                    = [ grep { $_ ne $fd } split /\s*,\s/, $cconf->{tee} ];
+            }
+            elsif ( $ttype eq 'ARRAY' ) {
+                ;    # OK
+            }
+            else {
+                die "unknown tee structure\n";
+            }
+            $cconf->{tee}
+                = [ grep { defined $_ && $_ ne $fd } @{ $cconf->{tee} } ];
+        }
+
+        # check redirect format
+        if ( defined $cconf->{redirect} ) {
+            die "unknown redirect fd.\n"
+                unless defined $cconf->{redirect}
+                    && $cconf->{redirect} =~ /^\d+$/;
+        }
+
+        # check tee format
+        if ( defined $cconf->{tee} ) {
+            for my $tee ( @{ $cconf->{tee} } ) {
+                die "unknown tee fd.\n"
+                    unless defined $tee && $tee =~ /^\d+$/;
+            }
+        }
+
+        # check header requirements
+        if ( defined $cconf->{header} ) {
+            for (qw( subject to from )) {
+                die "$_($fd) is not specified.\n"
+                    unless defined $cconf->{header}{$_};
+            }
+        }
+
+    }
+
+    # check loop redirect/tee
+    sub {
+        my ($config) = @_;
+
+        my %visited;
+        my $has_loop = sub {
+            my ( $callee, $start, $fd, $trace ) = @_;
+            $trace = [ @$trace, $fd ];
+
+            my $cconf = $config->{$fd} or return;
+
+            if ( !defined $visited{$fd} ) {
+                $visited{$fd} = $start;
+                my $t;
+                if ( defined $cconf->{redirect} ) {
+                    $t = $callee->(
+                        $callee, $start, $cconf->{redirect}, $trace
+                    );
+                }
+                else {
+                    for ( @{ $cconf->{tee} } ) {
+                        $t = $callee->( $callee, $start, $_, $trace );
+                    }
+                }
+                return $t if defined $t;
+                return;
+            }
+            elsif ( $visited{$fd} != $start ) {
+                return;
+            }
+            else {
+                return $trace;
+            }
+        };
+
+        for my $fd (@fd) {
+            my $loop = $has_loop->( $has_loop, $fd, $fd, [] );
+            die "loop redirect/tee detected: ", join( ' => ', @$loop )
+                if $loop;
+        }
+        }
+        ->( \%config );
+};
+if ($@) {
+    warn "$@\n";
+    print encode_utf8 Dump( \%config );
+    exit 9;
+}
+
+if ($DUMP) {
+    print "OK\n";
+    print encode_utf8 Dump( \%config );
+    exit;
+}
+die usage() unless @ARGV;
+
+## fill date
+{
+    my $time = time;
+    for my $fd (@fd) {
+        next unless defined $config{$fd}{header};
+        next if defined $config{$fd}{header}{date};
+
+        $config{$fd}{header}{date} = $time;
+    }
+}
+
+## reserve fd
+for my $fd (@fd) {
+    next unless $fd > 2;
+    dup2( 1, $fd ) or die $!;
+}
+
+## pipes / file
+my $pipes = LogMailer::FHStore->new;
+for my $fd (@fd) {
+    next if defined $config{$fd}{redirect};
+
+    $pipes->create_pipe($fd);
+    if ( defined $config{$fd}{file} ) {
+        open my $fh, '>>', $config{$fd}{file} or die $!;
+        $fh->autoflush(1);
+        $pipes->add_tfh( $fd, $fh );
+    }
+}
+
+## tee
+for my $fd (@fd) {
+    my $conf = $config{$fd};
+    next if defined $conf->{redirect};
+    next unless defined $conf->{tee};
+
+    for my $tfd ( ref $conf->{tee} ? @{ $conf->{tee} } : $conf->{tee} ) {
+        $pipes->add_tfh( $fd, $pipes->get_wfh($tfd) );
+    }
+}
+
+## create mailer
+{
+    my %mailer;
+    for my $fd (@fd) {
+        next if defined $config{$fd}{redirect};
+        $mailer{$fd} = LogMailer::Mailer->spawn( $fd, $config{$fd}, $pipes );
+    }
+
+    ## wait for all mailer ready
+    for my $fd ( sort keys %mailer ) {
+        my $fh = $mailer{$fd};
+        if ( <$fh> ne 'READY' ) {
+            die "failed to start mailer(fd:$fd).\n";
+        }
+
+        #warn "$fd ready\n";
+        close $fh;
+    }
+}
+
+## redirect
+for my $fd (@fd) {
+    if ( defined $config{$fd}{redirect} ) {
+        dup2( $config{$fd}{redirect}, $fd ) or die $!;
+    }
+    else {
+        dup2( fileno( $pipes->get_wfh($fd) ), $fd ) or die $!;
+    }
+}
+
+## close unused fh
+$pipes->clear;
+
+## exec
+exec @ARGV;
+
+__END__
+
+=encoding utf-8
+
+=head1 NAME
+
+logmailer - コマンドの出力をメール送信する
+
+=head1 USAGE
+
+ $ logmailer OPTIONS COMMAND [ARGS...]
+
+=head1 DESCRIPTION
+
+logmailer は、出力ハンドラプロセスを複数立ち上げ、指定されたファイルディ
+スクリプタを接続した後、I<COMMAND> を exec する。
+
+デフォルトでは、標準出力、標準エラー出力をハンドルするが、3番以降の任意
+のファイルディスクリプタもハンドル可能である。
+
+なお、出力が何も無い場合は、メールは送信されない。このため、動作ログは
+標準出力、エラーはエラー出力に対して出力するコマンドであれば、エラー発
+生時にのみ特別の Subject を持ったエラーメールを送信することができる。
+
+=head1 OPTIONS
+
+=over 4
+
+=item --help
+
+このヘルプを表示する。
+
+=item --version
+
+バージョンを表示する。
+
+=item --dump
+
+設定を表示する。
+
+=back
+
+以下のオプションは、定義された順に処理される。
+
+なお、I<VALUE> が "ファイルディスクリプタ:" で始まる場合は数字で示され
+たファイルディスクリプタの設定、そうでない場合は、デフォルト設定として
+扱われる。ファイルディスクリプタは、カンマ区切りで複数指定可能である。
+
+また、I<FD> も、カンマ区切りにより複数指定可能である。
+
+デフォルト設定は、すべてのオプションを読み込んだ後に、定義済みの各ファ
+イルディスクリプタ設定にマージされる。各ファイルディスクリプタの設定と
+デフォルト設定が競合した場合は、各ファイルディスクリプタの設定が優先さ
+れる。
+
+=over 4
+
+=item --config=I<YAML_FILENAME>
+
+これまでの設定を削除し、I<YAML_FILENAME> の内容で上書きする。
+
+構文は、コマンドライン引数で任意の設定を行い、--dump オプションを付加し
+て呼び出した場合の出力を参照のこと。
+
+=back
+
+以下のオプションは、定義された順に処理される。
+
+=over 4
+
+=item --type=I<VALUE>
+
+メールの送信方法を指定する。I<VALUE> は以下の何れかの値をとる。
+
+=over 2
+
+=item * Mail::Mailer コンストラクタの第1引数
+
+=item * "redirect"
+
+メールを送信せず、--redirect オプションで設定されたファイルディスクリプ
+タにリダイレクトする。
+
+=item * "nomail"
+
+メールを送信しない。
+
+=back
+
+=item --redirect=I<VALUE>
+
+ファイルディスクリプタ I<VALUE> にリダイレクトする。
+
+メールは送信されず、オプション --tee, --file の指定は無視される。
+
+また、自身のファイルディスクリプタへのリダイレクト設定は無視される。
+
+=item --tee=I<FD>
+
+ファイルディスクリプタ I<FD> にもコピーする。
+
+また、自身のファイルディスクリプタへのコピー設定は無視される。
+
+=item --file=I<VALUE>
+
+ファイル名 I<VALUE> にも追記保存する。
+
+=item --timestamp[=I<VALUE>], --ts[=I<VALUE>]
+
+入力された各行に、strftime でフォーマットされた I<VALUE> を付加する。
+
+I<VALUE> が省略された場合は、'%F %T - ' が指定されたものとする。
+
+=item --notimestamp=I<FD>, --nots=I<FD>
+
+ファイルディスクリプタ I<FD> の --timestamp 設定を無効にする。
+
+=item --header=I<KEY>=I<VALUE>
+
+メールヘッダ I<KEY> を I<VALUE> に設定する。
+
+=item --mailer=I<KEY>=I<VALUE>
+
+L<Mail::Mailer> コンストラクタの第2引数以降に渡す値を設定する。
+
+=item --subject=I<VALUE>
+
+--header=subject=I<VALUE> のエイリアス。
+
+=item --subject-prefix=I<VALUE>
+
+--header=subject-prefix=I<VALUE> のエイリアス。
+
+=item --subject-suffix=I<VALUE>
+
+--header=subject-suffix=I<VALUE> のエイリアス。
+
+=item --to=I<VALUE>
+
+--header=to=I<VALUE> のエイリアス。
+
+=back
+
+=head1 EXAMPLES
+
+以下の例は、標準出力と標準エラー出力を各行にタイムスタンプを付加してメー
+ルサーバ localhost からメール送信する。標準エラー出力メールの Subject
+は、先頭に"**ALERT**" を付加する。また、標準出力と標準エラー出力をファ
+イル "backup.log" に出力する。
+
+ $ logmailer --type=smtp --mailer=Server=localhost --ts \
+   --subject=BackupResult --subject-prefix='2:**ALERT**' \
+   --tee=3 --type=3:nomail --file=3:backup.log --nots=3 \
+   SOME_BACKUP_COMMAND
+
+=head1 TIPS
+
+設定方法が複雑なため、以下の順で確認するとよいかもしれない。
+このとき、I<COMMAND> は、"echo foo; echo bar >&2" などとするとよい。
+
+=over 4
+
+=item 1. --dump オプションを指定し、エラーが無いことを確認する。
+
+=item 2. --type=testfile オプションを指定し、出力された mailer.testfile の内容が正しいことを確認する
+
+=back
+
+=head1 KNOWN ISSUES
+
+=over 4
+
+=item 設定の事前チェックが完全ではない。
+
+本運用する前に、期待する動作が行われることを確認する必要がある。
+
+=back
+
+=head1 AUTHOR
+
+YAMAMOTO, N. <nym at nym.jp>
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright (C) 2011 YAMAMOTO, N. <nym at nym.jp>
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of either: the GNU General Public License as published
+by the Free Software Foundation; or the Artistic License.
+
+See http://dev.perl.org/licenses/ for more information.
+
+=cut
