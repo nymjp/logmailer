@@ -18,10 +18,11 @@ use utf8;
 use strict;
 use warnings;
 
-our $VERSION = 0.01;
+our $VERSION = 0.02;
 
 package LogMailer::FHStore;
 use FileHandle;
+use File::Temp;
 
 sub new {
     my $class = shift;
@@ -88,11 +89,17 @@ sub new {
             ? Mail::Mailer->new( $conf->{type}, %{ $conf->{mailer} } )
             : undef
         ),
-        timestamp => $conf->{timestamp},
-        fh        => $tee,
-        is_init   => undef,
+        mail_buffer => (
+            $conf->{mailer} ? File::Temp->new(
+                TEMPLATE => 'logmailer.XXXXXXXX',
+                CLEANUP  => 1,
+                TMPDIR   => 1,
+                ) : undef
+        ),
+        has_content => undef,
+        timestamp   => $conf->{timestamp},
+        fh          => $tee,
     }, $class;
-    unshift @{ $self->{fh} }, $self->{mailer} if $self->{mailer};
     $self;
 }
 
@@ -119,14 +126,10 @@ sub spawn {
         close $from_child_fh;
 
         while (<$fh>) {
-
-            #warn "read(", fileno($fh), "): $_";
+            ##warn "read(", fileno($fh), "): $_";
             $obj->write_line($_);
         }
-        if ( $obj->{mailer} && $obj->{is_init} ) {
-            $obj->{mailer}->close
-                or die "couldn't send whole message: $!\n";
-        }
+        $obj->finish;
 
         #warn "done.";
         exit 0;
@@ -156,19 +159,40 @@ sub encode_header {
 
 sub write_line {
     my $self = shift;
-    if ( !$self->{is_init} ) {
-        my $mailer = $self->{mailer};
-        $self->{mailer}->open( $self->{header} ) if $self->{mailer};
-        $self->{is_init} = 1;
-    }
+    $self->{has_content} = 1;
 
     if ( defined $self->{timestamp} ) {
         unshift @_, strftime( $self->{timestamp}, localtime );
     }
 
+    if ( $self->{mail_buffer} ) {
+        print { $self->{mail_buffer} } @_;
+    }
     for ( @{ $self->{fh} } ) {
         print $_ @_ or die "write error!!";
     }
+}
+
+sub finish {
+    my $self = shift;
+    return 1 unless ( $self->{mailer} && $self->{has_content} );
+
+    ## mail send
+    my $mailer = $self->{mailer};
+
+    #warn "mailer open.";
+    $mailer->open( $self->{header} );
+
+    my $buffer = $self->{mail_buffer};
+    seek $buffer, 0, 0;
+
+    #warn "send content.";
+    print $mailer $_ while (<$buffer>);
+
+    #warn "mailer close.";
+    $mailer->close
+        or die "couldn't send whole message: $!\n";
+    1;
 }
 
 package main;
